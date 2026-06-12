@@ -50,6 +50,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 SD_GRPO_LOSS_MODES = {"grpo_sd", "grpo_antisd"}
+SAMPLED_LOGP_DISTILL_LOSS_MODE = "sampled_logp_distill"
+SELF_DISTILLATION_LOSS_MODES = {"sdpo", *SD_GRPO_LOSS_MODES, SAMPLED_LOGP_DISTILL_LOSS_MODE}
 
 
 def _normalize_prm(prm: torch.Tensor, response_mask: torch.Tensor, mode: str) -> torch.Tensor:
@@ -76,7 +78,7 @@ def _normalize_prm(prm: torch.Tensor, response_mask: torch.Tensor, mode: str) ->
     if mode == "none":
         return prm * response_mask
 
-    raise ValueError(f"Unsupported grpo_prm_normalize_mode: {mode}")
+    raise ValueError(f"Unsupported PRM normalize mode: {mode}")
 
 
 class TrustRegionTeacher(nn.Module):
@@ -163,7 +165,7 @@ class DataParallelPPOActor(BasePPOActor):
     def _update_teacher(self) -> None:
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        if not self_distillation_cfg or (loss_mode != "sdpo" and loss_mode not in SD_GRPO_LOSS_MODES):
+        if not self_distillation_cfg or loss_mode not in SELF_DISTILLATION_LOSS_MODES:
             return
         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
         if teacher_regularization != "ema":
@@ -712,7 +714,7 @@ class DataParallelPPOActor(BasePPOActor):
         pad_token_id = data.meta_info.get("pad_token_id", 0)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-        self_distillation_enabled = loss_mode == "sdpo" or loss_mode in SD_GRPO_LOSS_MODES
+        self_distillation_enabled = loss_mode in SELF_DISTILLATION_LOSS_MODES
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         if self_distillation_enabled:
             self_distillation_required_keys = {
@@ -805,7 +807,7 @@ class DataParallelPPOActor(BasePPOActor):
                     teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
                     if teacher_regularization == "trust-region" and self.use_fused_kernels:
                         raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
-                    # grpo_sd/grpo_antisd only need sampled-token log-probs.
+                    # grpo_sd/grpo_antisd/sampled_logp_distill only need sampled-token log-probs.
                     return_all_logps = (
                         loss_mode == "sdpo"
                         and self_distillation_cfg.full_logit_distillation
@@ -920,6 +922,49 @@ class DataParallelPPOActor(BasePPOActor):
                                 pg_metrics[f"{loss_mode}/A_refined_abs_mean"] = 0.0
                             pg_metrics[f"{loss_mode}/prm_lambda"] = prm_lambda
                             pg_metrics[f"{loss_mode}/prm_sign"] = prm_sign
+                        elif loss_mode == SAMPLED_LOGP_DISTILL_LOSS_MODE:
+                            valid_sd_mask = response_mask
+                            if self_distillation_mask is not None:
+                                valid_sd_mask = valid_sd_mask * self_distillation_mask.unsqueeze(-1)
+                            logp_gap = (teacher_log_prob - log_prob).detach() * valid_sd_mask
+                            normalize_mode = self_distillation_cfg.get(
+                                "sampled_logp_distill_normalize_mode", "sequence"
+                            )
+                            token_advantages = _normalize_prm(logp_gap, valid_sd_mask, normalize_mode)
+                            token_adv_clip = self_distillation_cfg.get("sampled_logp_distill_clip", 5.0)
+                            if token_adv_clip is not None:
+                                token_advantages = token_advantages.clamp(
+                                    -float(token_adv_clip), float(token_adv_clip)
+                                )
+                            token_adv_lambda = float(self_distillation_cfg.get("sampled_logp_distill_lambda", 1.0))
+                            distill_advantages = token_adv_lambda * token_advantages
+
+                            policy_loss_fn = get_policy_loss_fn("vanilla")
+                            pg_loss, pg_metrics = policy_loss_fn(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=distill_advantages,
+                                response_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
+                            )
+                            valid = valid_sd_mask.bool()
+                            if valid.any():
+                                pg_metrics[f"{loss_mode}/logp_gap_mean"] = logp_gap[valid].mean().item()
+                                pg_metrics[f"{loss_mode}/logp_gap_abs_mean"] = logp_gap[valid].abs().mean().item()
+                                pg_metrics[f"{loss_mode}/token_adv_mean"] = token_advantages[valid].mean().item()
+                                pg_metrics[f"{loss_mode}/token_adv_abs_mean"] = token_advantages[valid].abs().mean().item()
+                                pg_metrics[f"{loss_mode}/distill_adv_abs_mean"] = distill_advantages[valid].abs().mean().item()
+                                pg_metrics[f"{loss_mode}/A_grpo_abs_mean"] = advantages[valid].abs().mean().item()
+                            else:
+                                pg_metrics[f"{loss_mode}/logp_gap_mean"] = 0.0
+                                pg_metrics[f"{loss_mode}/logp_gap_abs_mean"] = 0.0
+                                pg_metrics[f"{loss_mode}/token_adv_mean"] = 0.0
+                                pg_metrics[f"{loss_mode}/token_adv_abs_mean"] = 0.0
+                                pg_metrics[f"{loss_mode}/distill_adv_abs_mean"] = 0.0
+                                pg_metrics[f"{loss_mode}/A_grpo_abs_mean"] = 0.0
+                            pg_metrics[f"{loss_mode}/lambda"] = token_adv_lambda
                         else:
                             pg_loss, pg_metrics = compute_self_distillation_loss(
                                 student_log_probs=log_prob,

@@ -128,13 +128,15 @@ class TaskRunner:
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        self_distillation_loss_modes = {"sdpo", "grpo_sd", "grpo_antisd"}
+        self_distillation_loss_modes = {"sdpo", "grpo_sd", "grpo_antisd", "sampled_logp_distill"}
         self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode in self_distillation_loss_modes
         if self_distillation_needs_ref and need_reference_policy(config):
-            raise ValueError("SDPO/grpo_sd/grpo_antisd cannot share the reference policy with KL regularization.")
+            raise ValueError(
+                "SDPO/grpo_sd/grpo_antisd/sampled_logp_distill cannot share the reference policy with KL regularization."
+            )
         if self_distillation_needs_ref and use_legacy_worker_impl == "disable":
             raise ValueError(
-                "SDPO/grpo_sd/grpo_antisd requires the legacy worker implementation to colocate the teacher."
+                "SDPO/grpo_sd/grpo_antisd/sampled_logp_distill requires the legacy worker implementation to colocate the teacher."
             )
 
         # use new model engine implementation

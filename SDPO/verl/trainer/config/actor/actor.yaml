@@ -57,7 +57,7 @@ policy_loss:
   # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.PolicyLossConfig
 
-  # Loss function mode: vanilla / clip-cov / kl-cov / gpg / sdpo / grpo_sd / grpo_antisd
+  # Loss function mode: vanilla / clip-cov / kl-cov / gpg / sdpo / grpo_sd / grpo_antisd / sampled_logp_distill
   loss_mode: "vanilla"
 
   # Ratio of tokens to be clipped for clip-cov loss
@@ -81,7 +81,7 @@ self_distillation:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.SelfDistillationConfig
 
-  # Distillation teacher prompts are enabled when policy_loss.loss_mode is sdpo / grpo_sd / grpo_antisd.
+  # Distillation teacher prompts are enabled when policy_loss.loss_mode is sdpo / grpo_sd / grpo_antisd / sampled_logp_distill.
 
   # Whether to use full-logit KL distillation
   full_logit_distillation: True
@@ -136,6 +136,16 @@ self_distillation:
 
   # Clamp normalized PRM magnitude; null disables clipping.
   grpo_prm_clip: 5.0
+
+  # Coefficient for sampled_logp_distill.
+  # This mode runs vanilla PPO with A = lambda * normalize(logp_teacher(sampled token) - logp_student(sampled token)).
+  sampled_logp_distill_lambda: 1.0
+
+  # Log-prob gap normalization for sampled_logp_distill: none / batch / sequence / sequence_demean
+  sampled_logp_distill_normalize_mode: sequence
+
+  # Clamp normalized sampled-logp advantage magnitude; null disables clipping.
+  sampled_logp_distill_clip: 5.0
 
   # Reprompting template - available variables: prompt, successful_previous_attempt, feedback
   reprompt_template: |-

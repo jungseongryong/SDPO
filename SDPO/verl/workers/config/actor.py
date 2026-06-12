@@ -41,7 +41,7 @@ class SelfDistillationConfig(BaseConfig):
 
     Args:
         Distillation teacher prompts are enabled when policy_loss.loss_mode is "sdpo",
-        "grpo_sd", or "grpo_antisd".
+        "grpo_sd", "grpo_antisd", or "sampled_logp_distill".
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
         alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
@@ -94,6 +94,9 @@ class SelfDistillationConfig(BaseConfig):
     grpo_prm_lambda: float = 0.1
     grpo_prm_normalize_mode: str = "sequence"
     grpo_prm_clip: Optional[float] = 5.0
+    sampled_logp_distill_lambda: float = 1.0
+    sampled_logp_distill_normalize_mode: str = "sequence"
+    sampled_logp_distill_clip: Optional[float] = 5.0
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -122,6 +125,16 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.grpo_prm_clip is not None and self.grpo_prm_clip <= 0:
             raise ValueError(f"self_distillation.grpo_prm_clip must be positive, got {self.grpo_prm_clip}")
+        if self.sampled_logp_distill_normalize_mode not in valid_prm_normalize_modes:
+            raise ValueError(
+                "self_distillation.sampled_logp_distill_normalize_mode must be one of "
+                f"{valid_prm_normalize_modes}, got {self.sampled_logp_distill_normalize_mode}"
+            )
+        if self.sampled_logp_distill_clip is not None and self.sampled_logp_distill_clip <= 0:
+            raise ValueError(
+                "self_distillation.sampled_logp_distill_clip must be positive, "
+                f"got {self.sampled_logp_distill_clip}"
+            )
 
 
 @dataclass
@@ -161,7 +174,7 @@ class PolicyLossConfig(BaseConfig):
 
     Args:
         loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo',
-            'grpo_sd', 'grpo_antisd'.
+            'grpo_sd', 'grpo_antisd', 'sampled_logp_distill'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
