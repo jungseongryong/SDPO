@@ -34,6 +34,7 @@ TP_TARGET_RATIO="${TP_TARGET_RATIO:-0.93}"
 REACTIVATE_RATIO="${REACTIVATE_RATIO:-1.07}"
 
 # v33 ablation knobs
+LOSS_MODE="${LOSS_MODE:-grpo_ca}"
 PRM_CONSTRUCTION="${PRM_CONSTRUCTION:-reverse}"
 PRM_FORWARD_MODE="${PRM_FORWARD_MODE:-jsd_unbiased}"
 # Composition mode for advantage refinement; "rlsd" = Yang 2026 magnitude-only baseline
@@ -149,7 +150,7 @@ CONFIG_ARGS=(
     actor_rollout_ref.actor.optim.lr=1e-6
     actor_rollout_ref.actor.optim.lr_warmup_steps=0
     actor_rollout_ref.actor.ppo_mini_batch_size=32
-    actor_rollout_ref.actor.policy_loss.loss_mode=grpo_ca
+    actor_rollout_ref.actor.policy_loss.loss_mode=${LOSS_MODE}
     actor_rollout_ref.actor.self_distillation.teacher_update_rate=1.0
     actor_rollout_ref.actor.self_distillation.max_solution_tokens=3072
     actor_rollout_ref.actor.self_distillation.max_reprompt_len=4096
@@ -271,6 +272,7 @@ CONFIG_ARGS+=(
     "+ray_kwargs.ray_init.runtime_env.env_vars.CC=${CC}"
     "+ray_kwargs.ray_init.runtime_env.env_vars.CXX=${CXX}"
 )
+CONFIG_ARGS+=( "$@" )
 
 echo "[launch] EXP_NAME = ${EXP_NAME}"
 echo "[launch] python3 -m verl.trainer.main_ppo  (NNODES=${NNODES} N_GPUS_PER_NODE=${N_GPUS_PER_NODE})"
