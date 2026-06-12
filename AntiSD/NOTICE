@@ -1,0 +1,40 @@
+AntiSD: Anti-Self-Distillation for Reasoning RL
+Copyright 2026 The AntiSD Authors
+
+This product includes software developed by the volcano engine reinforcement
+learning team at ByteDance:
+
+    verl: a flexible, efficient and production-ready RL training library
+          for large language models
+    https://github.com/volcengine/verl
+    Apache License 2.0
+
+The AntiSD codebase is a fork of verl with additions in the following areas:
+
+  * verl/workers/actor/dp_actor.py
+        — `grpo_ca` loss path: PRM construction, JSD-unbiased forward,
+          adaptive u-clip, teacher-perplexity λ controller with Schmitt
+          hysteresis, length mask.
+  * verl/workers/config/actor.py
+        — CCIRConfig and SelfDistillationConfig dataclasses.
+  * verl/trainer/ppo/ray_trainer.py
+        — `_maybe_build_self_distillation_batch`: self-distillation rollout
+          construction (group-wise solution selection, budget-aware
+          truncation, environment-feedback templates, multi-turn /
+          system-prefix / suffix reprompt styles).
+  * verl/trainer/ppo/core_algos.py
+        — `compute_self_distillation_loss`: full-logit / top-K teacher
+          distillation losses.
+  * recipe/antisd/
+        — nine launch scripts reproducing the paper's main results
+          (3 base models × 3 methods).
+  * data/
+        — dataset preprocessing scripts for DAPO-Math, deepmath, AIME 2024 /
+          2025, HMMT 2025, BeyondAIME.
+
+All other files retain their original copyright notices and license terms
+from upstream verl. See `LICENSE` for the Apache 2.0 license text.
+
+The original SDPO branding (folder names, internal experiment tags) has been
+removed from documentation; the algorithm is referred to throughout as AntiSD
+(Anti-Self-Distillation).
