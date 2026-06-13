@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -140,7 +141,7 @@ class DataParallelPPOActor(BasePPOActor):
     def _update_teacher(self) -> None:
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        if not self_distillation_cfg or loss_mode not in ("sdpo", "grpo_ccir", "grpo_st", "grpo_ca"):
+        if not self_distillation_cfg or loss_mode not in ("sdpo", "srpo", "grpo_ccir", "grpo_st", "grpo_ca"):
             return
         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
         if teacher_regularization != "ema":
@@ -689,7 +690,7 @@ class DataParallelPPOActor(BasePPOActor):
         pad_token_id = data.meta_info.get("pad_token_id", 0)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-        self_distillation_enabled = loss_mode in ("sdpo", "grpo_ccir", "grpo_st", "grpo_ca")
+        self_distillation_enabled = loss_mode in ("sdpo", "srpo", "grpo_ccir", "grpo_st", "grpo_ca")
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         if self_distillation_enabled:
             self_distillation_required_keys = {
@@ -709,6 +710,10 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if "token_level_scores" in data.batch.keys():
+            select_keys.append("token_level_scores")
+        elif "token_level_rewards" in data.batch.keys():
+            select_keys.append("token_level_rewards")
         if self.use_prefix_grouper and "prompts" in data.batch.keys():
             select_keys.append("prompts")
         if self.config.use_kl_loss:
@@ -1016,7 +1021,117 @@ class DataParallelPPOActor(BasePPOActor):
                                 )
                             si_sol_log_prob = sol_outputs["log_probs"]
 
-                        if loss_mode == "grpo_ccir":
+                        if loss_mode == "srpo":
+                            if "token_level_scores" in model_inputs:
+                                seq_scores = model_inputs["token_level_scores"].sum(dim=-1)
+                            elif "token_level_rewards" in model_inputs:
+                                seq_scores = model_inputs["token_level_rewards"].sum(dim=-1)
+                            else:
+                                raise ValueError("loss_mode='srpo' requires token_level_scores or token_level_rewards.")
+
+                            success_threshold = float(self_distillation_cfg.get("success_reward_threshold", 0.5))
+                            correct_seq = seq_scores >= success_threshold
+                            teacher_available = self_distillation_mask.bool()
+                            sdpo_seq = (~correct_seq) & teacher_available
+                            grpo_seq = ~sdpo_seq
+
+                            # GRPO branch: vanilla PPO clipped surrogate on routed samples.
+                            clip_ratio = self.config.clip_ratio
+                            clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+                            clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+                            clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
+                            neg_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
+                            ratio = torch.exp(neg_approx_kl)
+                            pg_losses1 = -advantages * ratio
+                            pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+                            clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+                            pg_losses3 = -advantages * clip_ratio_c
+                            clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+                            grpo_per_token_loss = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+                            # SDPO branch: top-k JSD with entropy-aware dynamic token weighting.
+                            if not self_distillation_cfg.full_logit_distillation or self_distillation_cfg.distillation_topk is None:
+                                raise ValueError("SRPO currently requires full_logit_distillation=True and distillation_topk set.")
+                            if student_topk_logps is None or teacher_topk_logps is None:
+                                raise ValueError("SRPO top-k SDPO branch requires student_topk_logps and teacher_topk_logps.")
+
+                            def _add_tail(log_probs: torch.Tensor) -> torch.Tensor:
+                                log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
+                                log_s = torch.clamp(log_s, max=-1e-7)
+                                tail_log = torch.log(-torch.expm1(log_s))
+                                return torch.cat([log_probs, tail_log], dim=-1)
+
+                            def _renorm(log_probs: torch.Tensor) -> torch.Tensor:
+                                return log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True)
+
+                            student_distill_logps = student_topk_logps
+                            teacher_distill_logps = teacher_topk_logps
+                            if self_distillation_cfg.distillation_add_tail:
+                                student_distill_logps = _add_tail(student_distill_logps)
+                                teacher_distill_logps = _add_tail(teacher_distill_logps)
+                            else:
+                                student_distill_logps = _renorm(student_distill_logps)
+                                teacher_distill_logps = _renorm(teacher_distill_logps)
+
+                            alpha = torch.tensor(
+                                float(self_distillation_cfg.alpha),
+                                dtype=student_distill_logps.dtype,
+                                device=student_distill_logps.device,
+                            )
+                            if float(self_distillation_cfg.alpha) == 0.0:
+                                sdpo_token_loss = F.kl_div(
+                                    student_distill_logps, teacher_distill_logps, reduction="none", log_target=True
+                                ).sum(dim=-1)
+                            elif float(self_distillation_cfg.alpha) == 1.0:
+                                sdpo_token_loss = F.kl_div(
+                                    teacher_distill_logps, student_distill_logps, reduction="none", log_target=True
+                                ).sum(dim=-1)
+                            else:
+                                mixture_logps = torch.logsumexp(
+                                    torch.stack(
+                                        [
+                                            student_distill_logps + torch.log(1 - alpha),
+                                            teacher_distill_logps + torch.log(alpha),
+                                        ]
+                                    ),
+                                    dim=0,
+                                )
+                                kl_teacher = F.kl_div(mixture_logps, teacher_distill_logps, reduction="none", log_target=True)
+                                kl_student = F.kl_div(mixture_logps, student_distill_logps, reduction="none", log_target=True)
+                                sdpo_token_loss = torch.lerp(kl_student, kl_teacher, alpha).sum(dim=-1)
+
+                            beta = float(self_distillation_cfg.get("srpo_beta", 1.0))
+                            teacher_probs = torch.exp(teacher_distill_logps)
+                            teacher_entropy = -(teacher_probs * teacher_distill_logps).sum(dim=-1)
+                            sdpo_token_mask = response_mask * sdpo_seq.to(dtype=response_mask.dtype).unsqueeze(-1)
+                            if sdpo_token_mask.any():
+                                raw_weights = torch.exp(-beta * teacher_entropy) * sdpo_token_mask
+                                mean_weight = raw_weights.sum() / sdpo_token_mask.sum().clamp(min=1.0)
+                                dynamic_weights = raw_weights / mean_weight.clamp(min=1e-8)
+                            else:
+                                dynamic_weights = torch.zeros_like(sdpo_token_loss)
+                            sdpo_per_token_loss = sdpo_token_loss * dynamic_weights
+
+                            grpo_token_mask = response_mask * grpo_seq.to(dtype=response_mask.dtype).unsqueeze(-1)
+                            combined_loss_mat = grpo_per_token_loss * grpo_token_mask + sdpo_per_token_loss * sdpo_token_mask
+                            combined_loss_mask = response_mask * (grpo_seq | sdpo_seq).to(dtype=response_mask.dtype).unsqueeze(-1)
+                            if rollout_is_weights is not None:
+                                combined_loss_mat = combined_loss_mat * rollout_is_weights
+                            pg_loss = agg_loss(
+                                loss_mat=combined_loss_mat,
+                                loss_mask=combined_loss_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                **self.config.global_batch_info,
+                            )
+                            pg_metrics = {
+                                "srpo/grpo_seq_fraction": grpo_seq.float().mean().item(),
+                                "srpo/sdpo_seq_fraction": sdpo_seq.float().mean().item(),
+                                "srpo/correct_seq_fraction": correct_seq.float().mean().item(),
+                                "srpo/dw_weight_mean": dynamic_weights[sdpo_token_mask.bool()].mean().item() if sdpo_token_mask.any() else 0.0,
+                                "srpo/teacher_entropy_mean": teacher_entropy[sdpo_token_mask.bool()].mean().item() if sdpo_token_mask.any() else 0.0,
+                            }
+                            micro_batch_metrics.update(pg_metrics)
+                        elif loss_mode == "grpo_ccir":
                             # ---- Part 1: L_GRPO with original advantages (no S_t modification) ----
                             policy_loss_fn = get_policy_loss_fn("vanilla")
                             pg_loss, pg_metrics = policy_loss_fn(
@@ -2287,6 +2402,39 @@ class DataParallelPPOActor(BasePPOActor):
                                 w_t = torch.exp(sign_A * delta_t)
                                 w_clipped = torch.clamp(w_t, 1.0 - rlsd_eps, 1.0 + rlsd_eps)
                                 modulator = (1.0 - rlsd_lam) + rlsd_lam * w_clipped if rlsd_lam < 1.0 else w_clipped
+                                refined_advantages = advantages * modulator
+                            elif ca_mode == "rlrt_all":
+                                # RLRT-All: RLSD with the teacher/student ratio reversed, applied to all rollouts.
+                                # A_t = A_seq · ((1-λ) + λ · clip(exp(sign(A_seq)·(s-t)), 1-ε, 1+ε))
+                                # This is the ungated ablation of RLRT: no r=1-only filter.
+                                rlsd_eps = float(ccir_cfg.get("rlsd_eps_w", 0.2))
+                                rlsd_lam = float(ccir_cfg.get("rlsd_lambda", 1.0))
+                                sign_A = torch.sign(advantages).detach()
+                                delta_t = (log_prob - teacher_log_prob).detach()
+                                w_t = torch.exp(sign_A * delta_t)
+                                w_clipped = torch.clamp(w_t, 1.0 - rlsd_eps, 1.0 + rlsd_eps)
+                                modulator = (1.0 - rlsd_lam) + rlsd_lam * w_clipped if rlsd_lam < 1.0 else w_clipped
+                                refined_advantages = advantages * modulator
+                            elif ca_mode == "rlrt":
+                                # RLRT: RLRT-All with the paper's reward gate.
+                                # Correct rollouts get reversed-teacher reweighting; other rollouts stay vanilla GRPO.
+                                rlsd_eps = float(ccir_cfg.get("rlsd_eps_w", 0.2))
+                                rlsd_lam = float(ccir_cfg.get("rlsd_lambda", 1.0))
+                                sign_A = torch.sign(advantages).detach()
+                                delta_t = (log_prob - teacher_log_prob).detach()
+                                w_t = torch.exp(sign_A * delta_t)
+                                w_clipped = torch.clamp(w_t, 1.0 - rlsd_eps, 1.0 + rlsd_eps)
+                                modulator = (1.0 - rlsd_lam) + rlsd_lam * w_clipped if rlsd_lam < 1.0 else w_clipped
+
+                                if "token_level_scores" in model_inputs:
+                                    seq_scores = model_inputs["token_level_scores"].sum(dim=-1)
+                                elif "token_level_rewards" in model_inputs:
+                                    seq_scores = model_inputs["token_level_rewards"].sum(dim=-1)
+                                else:
+                                    raise ValueError("ca_mode='rlrt' requires token_level_scores or token_level_rewards.")
+                                success_threshold = float(self_distillation_cfg.get("success_reward_threshold", 0.5))
+                                correct_mask = (seq_scores >= success_threshold).to(dtype=modulator.dtype).unsqueeze(-1)
+                                modulator = correct_mask * modulator + (1.0 - correct_mask)
                                 refined_advantages = advantages * modulator
                             else:
                                 # Additive: A_t = orm_weight * A_seq + ca_lambda * PRM_processed

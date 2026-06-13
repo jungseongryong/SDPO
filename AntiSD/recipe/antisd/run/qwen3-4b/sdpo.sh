@@ -14,4 +14,5 @@ EXP_NAME_SUFFIX="sdpo-jsd" \
     actor_rollout_ref.actor.self_distillation.full_logit_distillation=true \
     actor_rollout_ref.actor.self_distillation.distillation_topk=100 \
     actor_rollout_ref.actor.self_distillation.alpha=0.5 \
-    actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.0
+    actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.0 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85

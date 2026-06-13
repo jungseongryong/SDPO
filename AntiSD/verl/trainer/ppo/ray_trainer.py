@@ -859,7 +859,7 @@ class RayPPOTrainer:
     ) -> Optional[tuple[DataProto, dict[str, float]]]:
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if self_distillation_cfg is None or loss_mode not in ("sdpo", "grpo_ccir", "grpo_st", "grpo_ca"):
+        if self_distillation_cfg is None or loss_mode not in ("sdpo", "srpo", "grpo_ccir", "grpo_st", "grpo_ca"):
             return None
 
         device = batch.batch["input_ids"].device

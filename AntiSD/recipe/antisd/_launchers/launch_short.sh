@@ -86,6 +86,9 @@ LOG_CLIP="${LOG_CLIP:-5.0}"
 K_SIGMA="${K_SIGMA:-2.0}"
 LEN_MASK="${LEN_MASK:-0}"
 TENSOR_PARALLEL="${TENSOR_PARALLEL:-1}"
+ACTOR_LR="${ACTOR_LR:-1e-6}"
+TEACHER_UPDATE_RATE="${TEACHER_UPDATE_RATE:-1.0}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 
 # MODEL_NAME defaults to a sanitised MODEL_PATH; override (env var) to keep
 # experiment names short when MODEL_PATH points at a deep ckpt directory
@@ -132,6 +135,9 @@ fi
 
 CONFIG_ARGS=(
     --config-name sdpo
+    vars.dir="${SDPO_ROOT}"
+    vars.output_root="${SDPO_ROOT}"
+    vars.task="datasets/math"
     max_model_len=35328
     data.train_files="[${SDPO_ROOT}/datasets/math/train.parquet]"
     data.val_files="[${SDPO_ROOT}/datasets/math/aime25/test.parquet]"
@@ -144,14 +150,15 @@ CONFIG_ARGS=(
     actor_rollout_ref.model.path=$MODEL_PATH
     actor_rollout_ref.rollout.n=8
     actor_rollout_ref.rollout.tensor_model_parallel_size=$TENSOR_PARALLEL
+    actor_rollout_ref.rollout.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION}
     actor_rollout_ref.rollout.val_kwargs.n=4
     actor_rollout_ref.rollout.val_kwargs.response_length=32768
     "${extra_args[@]}"
-    actor_rollout_ref.actor.optim.lr=1e-6
+    actor_rollout_ref.actor.optim.lr=${ACTOR_LR}
     actor_rollout_ref.actor.optim.lr_warmup_steps=0
     actor_rollout_ref.actor.ppo_mini_batch_size=32
     actor_rollout_ref.actor.policy_loss.loss_mode=${LOSS_MODE}
-    actor_rollout_ref.actor.self_distillation.teacher_update_rate=1.0
+    actor_rollout_ref.actor.self_distillation.teacher_update_rate=${TEACHER_UPDATE_RATE}
     actor_rollout_ref.actor.self_distillation.max_solution_tokens=3072
     actor_rollout_ref.actor.self_distillation.max_reprompt_len=4096
     actor_rollout_ref.actor.self_distillation.solution_selection=random
@@ -216,6 +223,12 @@ CONFIG_ARGS=(
     trainer.default_local_dir="${SDPO_ROOT}/sdpo_ent_ckpt/${EXP_NAME}"
     trainer.validation_data_dir="${SDPO_ROOT}/outputs/${EXP_NAME}/validation"
     trainer.rollout_data_dir="${SDPO_ROOT}/outputs/${EXP_NAME}/rollout"
+    global_profiler.save_path="${SDPO_ROOT}/logs/profile"
+    actor_rollout_ref.actor.profiler.save_path="${SDPO_ROOT}/logs/profile"
+    actor_rollout_ref.rollout.profiler.save_path="${SDPO_ROOT}/logs/profile"
+    actor_rollout_ref.ref.profiler.save_path="${SDPO_ROOT}/logs/profile"
+    critic.profiler.save_path="${SDPO_ROOT}/logs/profile"
+    reward_model.profiler.save_path="${SDPO_ROOT}/logs/profile"
     "trainer.logger=['console','wandb']"
 )
 

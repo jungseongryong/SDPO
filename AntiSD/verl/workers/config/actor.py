@@ -71,6 +71,7 @@ class SelfDistillationConfig(BaseConfig):
     teacher_update_rate: float = 0.05
     distillation_topk: Optional[int] = None
     distillation_add_tail: bool = True
+    srpo_beta: float = 1.0
     max_reprompt_len: int = 10240
     reprompt_truncation: str = "left"
     dont_reprompt_on_self_success: bool = False
